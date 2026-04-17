@@ -2,11 +2,10 @@ from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
 from rlbot.messages.flat.QuickChatSelection import QuickChatSelection
 from rlbot.utils.structures.game_data_struct import GameTickPacket
 
-from util.ball_prediction_analysis import find_slice_at_time
-from util.boost_pad_tracker import BoostPadTracker
-from util.drive import steer_toward_target
 from util.sequence import Sequence, ControlStep
 from util.vec import Vec3
+
+import re
 
 
 class MyBot(BaseAgent):
@@ -14,76 +13,200 @@ class MyBot(BaseAgent):
     def __init__(self, name, team, index):
         super().__init__(name, team, index)
         self.active_sequence: Sequence = None
-        self.boost_pad_tracker = BoostPadTracker()
+        self.last_chat_time = 0
+        self.command_queue = None
 
-    def initialize_agent(self):
-        # Set up information about the boost pads now that the game is active and the info is available
-        self.boost_pad_tracker.initialize_boosts(self.get_field_info())
-
+    # -----------------------------
+    # MAIN LOOP
+    # -----------------------------
     def get_output(self, packet: GameTickPacket) -> SimpleControllerState:
-        """
-        This function will be called by the framework many times per second. This is where you can
-        see the motion of the ball, etc. and return controls to drive your car.
-        """
 
-        # Keep our boost pad info updated with which pads are currently active
-        self.boost_pad_tracker.update_boost_status(packet)
-
-        # This is good to keep at the beginning of get_output. It will allow you to continue
-        # any sequences that you may have started during a previous call to get_output.
+        # Continue any active shot sequence
         if self.active_sequence is not None and not self.active_sequence.done:
             controls = self.active_sequence.tick(packet)
             if controls is not None:
                 return controls
 
-        # Gather some information about our car and the ball
-        my_car = packet.game_cars[self.index]
-        car_location = Vec3(my_car.physics.location)
-        car_velocity = Vec3(my_car.physics.velocity)
-        ball_location = Vec3(packet.game_ball.physics.location)
+        # Check for new chat commands
+        self.read_player_chat(packet)
 
-        # By default we will chase the ball, but target_location can be changed later
-        target_location = ball_location
+        # If a command is waiting, execute it
+        if self.command_queue is not None:
+            self.execute_command(self.command_queue, packet)
+            self.command_queue = None
 
-        if car_location.dist(ball_location) > 1500:
-            # We're far away from the ball, let's try to lead it a little bit
-            ball_prediction = self.get_ball_prediction_struct()  # This can predict bounces, etc
-            ball_in_future = find_slice_at_time(ball_prediction, packet.game_info.seconds_elapsed + 2)
-
-            # ball_in_future might be None if we don't have an adequate ball prediction right now, like during
-            # replays, so check it to avoid errors.
-            if ball_in_future is not None:
-                target_location = Vec3(ball_in_future.physics.location)
-                self.renderer.draw_line_3d(ball_location, target_location, self.renderer.cyan())
-
-        # Draw some things to help understand what the bot is thinking
-        self.renderer.draw_line_3d(car_location, target_location, self.renderer.white())
-        self.renderer.draw_string_3d(car_location, 1, 1, f'Speed: {car_velocity.length():.1f}', self.renderer.white())
-        self.renderer.draw_rect_3d(target_location, 8, 8, True, self.renderer.cyan(), centered=True)
-
-        if 750 < car_velocity.length() < 800:
-            # We'll do a front flip if the car is moving at a certain speed.
-            return self.begin_front_flip(packet)
-
+        # Default behavior (drive toward ball)
         controls = SimpleControllerState()
-        controls.steer = steer_toward_target(my_car, target_location)
-        controls.throttle = 1.0
-        # You can set more controls if you want, like controls.boost.
-
+        controls.throttle = 1
         return controls
 
-    def begin_front_flip(self, packet):
-        # Send some quickchat just for fun
-        self.send_quick_chat(team_only=False, quick_chat=QuickChatSelection.Information_IGotIt)
+    # -----------------------------
+    # CHAT LISTENER
+    # -----------------------------
+    def read_player_chat(self, packet):
+        """
+        Reads text chat messages and extracts commands.
+        Only reacts to YOUR messages.
+        """
+        messages = packet.game_chat
+        for i in range(messages.num_messages):
+            msg = messages.messages[i]
+            if msg.player_index == self.index:  # Only your messages
+                text = msg.message.decode("utf-8").lower()
 
-        # Do a front flip. We will be committed to this for a few seconds and the bot will ignore other
-        # logic during that time because we are setting the active_sequence.
+                # Prevent double‑reading same message
+                if msg.time_sent > self.last_chat_time:
+                    self.last_chat_time = msg.time_sent
+                    self.command_queue = text
+
+    # -----------------------------
+    # COMMAND PARSER
+    # -----------------------------
+    def execute_command(self, text, packet):
+
+        # --- Speed‑based shots ---
+        if "ground pinch" in text:
+            speed = self.extract_number(text)
+            return self.begin_ground_pinch(packet, speed)
+
+        if "ceiling pinch" in text:
+            speed = self.extract_number(text)
+            return self.begin_ceiling_pinch(packet, speed)
+
+        if "kuxir pinch" in text:
+            speed = self.extract_number(text)
+            return self.begin_kuxir_pinch(packet, speed)
+
+        # --- Count‑based shots ---
+        if "heli resets" in text:
+            count = self.extract_number(text)
+            return self.begin_heli_resets(packet, count)
+
+        # --- Named shots ---
+        if text == "air dribble":
+            return self.begin_air_dribble(packet)
+
+        if text == "flip reset":
+            return self.begin_flip_reset(packet)
+
+        if text == "double flip reset":
+            return self.begin_multi_reset(packet, 2)
+
+        if text == "triple flip reset":
+            return self.begin_multi_reset(packet, 3)
+
+        if text == "quad reset":
+            return self.begin_multi_reset(packet, 4)
+
+        if text == "flip reset musty":
+            return self.begin_flip_reset_musty(packet)
+
+        if text == "flip reset musty off backboard into a psycho":
+            return self.begin_psycho(packet)
+
+    # -----------------------------
+    # HELPERS
+    # -----------------------------
+    def extract_number(self, text):
+        nums = re.findall(r"\d+", text)
+        return int(nums[0]) if nums else 100
+
+    # -----------------------------
+    # SHOT SEQUENCES
+    # -----------------------------
+    def begin_air_dribble(self, packet):
+        self.send_quick_chat(False, QuickChatSelection.Information_IGotIt)
         self.active_sequence = Sequence([
-            ControlStep(duration=0.05, controls=SimpleControllerState(jump=True)),
-            ControlStep(duration=0.05, controls=SimpleControllerState(jump=False)),
-            ControlStep(duration=0.2, controls=SimpleControllerState(jump=True, pitch=-1)),
-            ControlStep(duration=0.8, controls=SimpleControllerState()),
+            ControlStep(0.2, SimpleControllerState(jump=True)),
+            ControlStep(0.1, SimpleControllerState(jump=False)),
+            ControlStep(1.5, SimpleControllerState(boost=True, pitch=-0.3)),
         ])
+        return self.active_sequence.tick(packet)
 
-        # Return the controls associated with the beginning of the sequence so we can start right away.
+    def begin_flip_reset(self, packet):
+        self.active_sequence = Sequence([
+            ControlStep(0.15, SimpleControllerState(jump=True)),
+            ControlStep(0.05, SimpleControllerState(jump=False)),
+            ControlStep(0.4, SimpleControllerState(pitch=-1)),
+            ControlStep(0.1, SimpleControllerState(jump=True)),  # reset
+        ])
+        return self.active_sequence.tick(packet)
+
+    def begin_multi_reset(self, packet, count):
+        steps = []
+        for _ in range(count):
+            steps.extend([
+                ControlStep(0.15, SimpleControllerState(jump=True)),
+                ControlStep(0.05, SimpleControllerState(jump=False)),
+                ControlStep(0.4, SimpleControllerState(pitch=-1)),
+                ControlStep(0.1, SimpleControllerState(jump=True)),
+            ])
+        self.active_sequence = Sequence(steps)
+        return self.active_sequence.tick(packet)
+
+    def begin_flip_reset_musty(self, packet):
+        self.active_sequence = Sequence([
+            ControlStep(0.15, SimpleControllerState(jump=True)),
+            ControlStep(0.05, SimpleControllerState(jump=False)),
+            ControlStep(0.4, SimpleControllerState(pitch=-1)),
+            ControlStep(0.1, SimpleControllerState(jump=True)),  # reset
+            ControlStep(0.2, SimpleControllerState(pitch=1, yaw=1)),  # musty flick
+        ])
+        return self.active_sequence.tick(packet)
+
+    def begin_psycho(self, packet):
+        self.active_sequence = Sequence([
+            ControlStep(0.15, SimpleControllerState(jump=True)),
+            ControlStep(0.05, SimpleControllerState(jump=False)),
+            ControlStep(0.4, SimpleControllerState(pitch=-1)),
+            ControlStep(0.1, SimpleControllerState(jump=True)),  # reset
+            ControlStep(0.2, SimpleControllerState(pitch=1, yaw=1)),  # musty
+            ControlStep(0.8, SimpleControllerState(roll=1)),  # psycho spin
+        ])
+        return self.active_sequence.tick(packet)
+
+    # -----------------------------
+    # SPEED‑BASED SHOTS
+    # -----------------------------
+    def begin_ground_pinch(self, packet, speed):
+        power = min(max(speed / 150, 0.3), 1.0)
+        self.active_sequence = Sequence([
+            ControlStep(0.1, SimpleControllerState(jump=True)),
+            ControlStep(0.05, SimpleControllerState(jump=False)),
+            ControlStep(0.3, SimpleControllerState(boost=True, pitch=-0.5)),
+            ControlStep(0.1, SimpleControllerState(roll=1, yaw=1, throttle=power)),
+        ])
+        return self.active_sequence.tick(packet)
+
+    def begin_ceiling_pinch(self, packet, speed):
+        power = min(max(speed / 150, 0.3), 1.0)
+        self.active_sequence = Sequence([
+            ControlStep(0.3, SimpleControllerState(jump=True, pitch=-1)),
+            ControlStep(0.8, SimpleControllerState()),  # fall from ceiling
+            ControlStep(0.1, SimpleControllerState(roll=1, throttle=power)),
+        ])
+        return self.active_sequence.tick(packet)
+
+    def begin_kuxir_pinch(self, packet, speed):
+        power = min(max(speed / 150, 0.3), 1.0)
+        self.active_sequence = Sequence([
+            ControlStep(0.2, SimpleControllerState(jump=True)),
+            ControlStep(0.1, SimpleControllerState(jump=False)),
+            ControlStep(0.3, SimpleControllerState(roll=-1, yaw=-1, throttle=power)),
+        ])
+        return self.active_sequence.tick(packet)
+
+    # -----------------------------
+    # HELI RESETS
+    # -----------------------------
+    def begin_heli_resets(self, packet, count):
+        steps = []
+        for _ in range(count):
+            steps.extend([
+                ControlStep(0.15, SimpleControllerState(jump=True)),
+                ControlStep(0.05, SimpleControllerState(jump=False)),
+                ControlStep(0.4, SimpleControllerState(roll=1, pitch=-1)),
+                ControlStep(0.1, SimpleControllerState(jump=True)),
+            ])
+        self.active_sequence = Sequence(steps)
         return self.active_sequence.tick(packet)
